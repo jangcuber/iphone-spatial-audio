@@ -1,0 +1,29 @@
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+# personal / machine-specific
+run/config.sh
+run/phones.txt
+run/pc_key.pub
+run/logs/
+recordings/
+presets/*.json
+windows_host/state/
+windows_host/logs/
+windows_host/phones.txt
+windows_host/volwatch.exe
+*.wav
+*.caf
+# build outputs
+ios_client/dist/
+ios_client/battinfo/battinfo
+ios_client/snapswitch/deb/var/
+tools/recorder/macrec
+tools/recorder/iosrec
+tools/snapserver/snapserver
+tools/sysaudio/sysbridge
+tools/sysaudio/avlatency
+tools/sysaudio/build/
+폰 스피커.app/

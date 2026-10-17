@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key><string>io.github.jangcuber.snapclient</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/var/jb/bin/sh</string>
+		<string>/var/jb/usr/libexec/snapclient/run</string>
+	</array>
+	<key>UserName</key><string>mobile</string>
+	<key>RunAtLoad</key><true/>
+	<key>KeepAlive</key><true/>
+	<key>ThrottleInterval</key><integer>5</integer>
+	<key>Disabled</key><true/>
+</dict>
+</plist>

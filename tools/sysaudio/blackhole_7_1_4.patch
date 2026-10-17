@@ -1,0 +1,135 @@
+diff --git a/BlackHole/BlackHole.c b/BlackHole/BlackHole.c
+index 143af9d..4c61a81 100644
+--- a/BlackHole/BlackHole.c
++++ b/BlackHole/BlackHole.c
+@@ -268,6 +268,18 @@ static Boolean                      gBox_Acquired                       = kBox_A
+ static pthread_mutex_t              gDevice_IOMutex                     = PTHREAD_MUTEX_INITIALIZER;
+ static Float64                      gDevice_SampleRate                  = 48000.0;
+ static Float64                      gDevice_RequestedSampleRate         = 0.0;
++// iPhone Spatial Audio: 출력 지연(frame)을 앱에 알려 주어 영상 플레이어가 화면을 그만큼 늦추게 한다.
++// 이 장치로 낸 소리는 snapserver 버퍼 등을 거쳐 약 1.12 s 뒤 폰에서 나므로 0이면 영상보다 소리가 늦다.
++// AudioObjectSetPropertyData(kAudioDevicePropertyLatency, 출력 범위)로 바꿀 수 있고 저장소에 남는다.
++#ifndef kReported_Latency_Frames
++#ifdef kAtmos_7_1_4_Layout
++#define kReported_Latency_Frames 53712   // 1119 ms: 2026-10-09 실측(avlatency, 7대, buffer 1000)
++#else
++#define kReported_Latency_Frames 0
++#endif
++#endif
++#define kReported_Latency_Max_Frames (48000 * 5)
++static UInt32                       gDevice_ReportedLatency             = kReported_Latency_Frames;
+ static UInt64                       gDevice_IOIsRunning                 = 0;
+ static UInt64                       gDevice2_IOIsRunning                = 0;
+ static const UInt32                 kDevice_RingBufferSize              = 16384;
+@@ -777,6 +789,20 @@ static OSStatus	BlackHole_Initialize(AudioServerPlugInDriverRef inDriver, AudioS
+ 		CFRelease(theSettingsData);
+ 	}
+ 	
++	//	iPhone Spatial Audio: 저장된 출력 지연
++	theSettingsData = NULL;
++	gPlugIn_Host->CopyFromStorage(gPlugIn_Host, CFSTR("reported latency"), &theSettingsData);
++	if(theSettingsData != NULL)
++	{
++		if(CFGetTypeID(theSettingsData) == CFNumberGetTypeID())
++		{
++			SInt32 theValue = 0;
++			CFNumberGetValue((CFNumberRef)theSettingsData, kCFNumberSInt32Type, &theValue);
++			if(theValue >= 0 && theValue <= kReported_Latency_Max_Frames) gDevice_ReportedLatency = (UInt32)theValue;
++		}
++		CFRelease(theSettingsData);
++	}
++
+ 	//	set the box name directly as a last resort
+ 	if(gBox_Name == NULL)
+ 	{
+@@ -2249,7 +2275,6 @@ static OSStatus	BlackHole_IsDevicePropertySettable(AudioServerPlugInDriverRef in
+ 		case kAudioDevicePropertyDeviceIsRunning:
+ 		case kAudioDevicePropertyDeviceCanBeDefaultDevice:
+ 		case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice:
+-		case kAudioDevicePropertyLatency:
+ 		case kAudioDevicePropertyStreams:
+ 		case kAudioObjectPropertyControlList:
+ 		case kAudioDevicePropertySafetyOffset:
+@@ -2265,6 +2290,10 @@ static OSStatus	BlackHole_IsDevicePropertySettable(AudioServerPlugInDriverRef in
+ 		case kAudioDevicePropertyNominalSampleRate:
+ 			*outIsSettable = true;
+ 			break;
++
++		case kAudioDevicePropertyLatency:
++			*outIsSettable = (inAddress->mScope == kAudioObjectPropertyScopeOutput);
++			break;
+ 		
+ 		default:
+ 			theAnswer = kAudioHardwareUnknownPropertyError;
+@@ -2658,7 +2687,7 @@ static OSStatus	BlackHole_GetDevicePropertyData(AudioServerPlugInDriverRef inDri
+ 			//	This property returns the presentation latency of the device. For this,
+ 			//	device, the value is 0 due to the fact that it always vends silence.
+ 			FailWithAction(inDataSize < sizeof(UInt32), theAnswer = kAudioHardwareBadPropertySizeError, Done, "BlackHole_GetDevicePropertyData: not enough space for the return value of kAudioDevicePropertyLatency for the device");
+-			*((UInt32*)outData) = 0;
++			*((UInt32*)outData) = (inAddress->mScope == kAudioObjectPropertyScopeOutput) ? gDevice_ReportedLatency : 0;
+ 			*outDataSize = sizeof(UInt32);
+ 			break;
+ 
+@@ -2816,7 +2845,12 @@ static OSStatus	BlackHole_GetDevicePropertyData(AudioServerPlugInDriverRef inDri
+ 				((AudioChannelLayout*)outData)->mNumberChannelDescriptions = kNumber_Of_Channels;
+ 				for(theItemIndex = 0; theItemIndex < kNumber_Of_Channels; ++theItemIndex)
+ 				{
+-					((AudioChannelLayout*)outData)->mChannelDescriptions[theItemIndex].mChannelLabel = kAudioChannelLabel_Left + theItemIndex;
++					((AudioChannelLayout*)outData)->mChannelDescriptions[theItemIndex].mChannelLabel =
++#ifdef kAtmos_7_1_4_Layout
++					    // iPhone Spatial Audio: 12ch = Atmos 7.1.4 (L R C LFE Ls Rs Rls Rrs Vhl Vhr Ltr Rtr)
++					    (kNumber_Of_Channels == 12) ? ((const AudioChannelLabel[]){1, 2, 3, 4, 5, 6, 33, 34, 13, 15, 52, 54})[theItemIndex] :
++#endif
++					    kAudioChannelLabel_Left + theItemIndex;
+ 					((AudioChannelLayout*)outData)->mChannelDescriptions[theItemIndex].mChannelFlags = 0;
+ 					((AudioChannelLayout*)outData)->mChannelDescriptions[theItemIndex].mCoordinates[0] = 0;
+ 					((AudioChannelLayout*)outData)->mChannelDescriptions[theItemIndex].mCoordinates[1] = 0;
+@@ -2898,6 +2932,27 @@ static OSStatus	BlackHole_SetDevicePropertyData(AudioServerPlugInDriverRef inDri
+ 				dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{ gPlugIn_Host->RequestDeviceConfigurationChange(gPlugIn_Host, kObjectID_Device, ChangeAction_SetSampleRate, NULL); });
+ 			}
+ 			break;
++
++		case kAudioDevicePropertyLatency:
++			//	iPhone Spatial Audio: 출력 지연 바꾸기 (출력 범위만)
++			FailWithAction(inAddress->mScope != kAudioObjectPropertyScopeOutput, theAnswer = kAudioHardwareUnsupportedOperationError, Done, "BlackHole_SetDevicePropertyData: latency is settable only on the output scope");
++			FailWithAction(inDataSize != sizeof(UInt32), theAnswer = kAudioHardwareBadPropertySizeError, Done, "BlackHole_SetDevicePropertyData: wrong size for the data for kAudioDevicePropertyLatency");
++			FailWithAction(*((const UInt32*)inData) > kReported_Latency_Max_Frames, theAnswer = kAudioHardwareIllegalOperationError, Done, "BlackHole_SetDevicePropertyData: latency too large");
++			if(*((const UInt32*)inData) != gDevice_ReportedLatency)
++			{
++				gDevice_ReportedLatency = *((const UInt32*)inData);
++				CFNumberRef theNumber = CFNumberCreate(NULL, kCFNumberSInt32Type, &gDevice_ReportedLatency);
++				if(theNumber != NULL)
++				{
++					gPlugIn_Host->WriteToStorage(gPlugIn_Host, CFSTR("reported latency"), theNumber);
++					CFRelease(theNumber);
++				}
++				*outNumberPropertiesChanged = 1;
++				outChangedAddresses[0].mSelector = kAudioDevicePropertyLatency;
++				outChangedAddresses[0].mScope = kAudioObjectPropertyScopeOutput;
++				outChangedAddresses[0].mElement = kAudioObjectPropertyElementMain;
++			}
++			break;
+ 		
+ 		default:
+ 			theAnswer = kAudioHardwareUnknownPropertyError;
+diff --git a/BlackHole/BlackHole.plist b/BlackHole/BlackHole.plist
+index bcbc8d6..4899443 100644
+--- a/BlackHole/BlackHole.plist
++++ b/BlackHole/BlackHole.plist
+@@ -24,14 +24,14 @@
+ 	<string>596</string>
+ 	<key>CFPlugInFactories</key>
+ 	<dict>
+-		<key>e395c745-4eea-4d94-bb92-46224221047c</key>
++		<key>ec18a537-f530-4803-88c0-3cc634595c6d</key>
+ 		<string>BlackHole_Create</string>
+ 	</dict>
+ 	<key>CFPlugInTypes</key>
+ 	<dict>
+ 		<key>443ABAB8-E7B3-491A-B985-BEB9187030DB</key>
+ 		<array>
+-			<string>e395c745-4eea-4d94-bb92-46224221047c</string>
++			<string>ec18a537-f530-4803-88c0-3cc634595c6d</string>
+ 		</array>
+ 	</dict>
+ </dict>

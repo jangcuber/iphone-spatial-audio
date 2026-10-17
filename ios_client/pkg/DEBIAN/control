@@ -1,0 +1,10 @@
+Package: io.github.jangcuber.snapclient
+Name: Snapclient (iPhone Spatial Audio)
+Version: 0.35.0~sa16
+Architecture: iphoneos-arm64
+Maintainer: jangcuber (github.com/jangcuber)
+Author: Johannes Pohl (Snapcast), iOS port for iPhone Spatial Audio
+Section: Multimedia
+Description: Snapcast client for jailbroken iOS (Dopamine, rootless).
+ Plays a Snapcast stream through the built-in speaker. Adds --channel to
+ play one source channel on both speakers. GPL-3.0 (Snapcast).

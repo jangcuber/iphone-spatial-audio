@@ -1,0 +1,4 @@
+#!/var/jb/bin/sh
+mkdir -p /var/mobile/Library/Logs && chown mobile:mobile /var/mobile/Library/Logs 2>/dev/null
+echo "설치 완료. 먼저 'snapclient-ctl test <Mac IP>' 로 소리를 확인하고, 되면 'sudo snapclient-ctl enable'"
+exit 0

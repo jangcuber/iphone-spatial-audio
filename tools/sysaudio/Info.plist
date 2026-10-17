@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>io.github.jangcuber.sysbridge</string>
+<key>CFBundleName</key><string>sysbridge</string>
+<key>NSAudioCaptureUsageDescription</key><string>Mac 소리를 아이폰 스피커로 보내기 위해 시스템 오디오를 받습니다.</string>
+<key>NSMicrophoneUsageDescription</key><string>돌비 공간음향을 받는 가상 장치(SpatialPhones)의 입력을 읽어 아이폰 스피커로 보냅니다.</string>
+</dict></plist>

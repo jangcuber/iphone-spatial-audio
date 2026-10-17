@@ -1,0 +1,30 @@
+diff --git a/server/streamreader/asio_stream.hpp b/server/streamreader/asio_stream.hpp
+index 2457ddac..e2ed0387 100644
+--- a/server/streamreader/asio_stream.hpp
++++ b/server/streamreader/asio_stream.hpp
+@@ -35,6 +35,9 @@
+ namespace streamreader
+ {
+ 
++/// spatial-audio: tolerated read lateness before the stream timeline is reset
++static constexpr std::chrono::milliseconds kMaxLateness{500};
++
+ using namespace std::chrono_literals;
+ 
+ /// Boost asio based stream class interface
+@@ -269,7 +272,14 @@ void AsioStream<ReadStream>::do_read()
+             });
+             return;
+         }
+-        // Read took longer, wait for the buffer to fill up
++        // Read took longer than one chunk.
++        // spatial-audio: a late timer wakeup (macOS delays it by up to ~75 ms) is not data loss
++        // when the writer keeps the pipe ahead. Read the next chunk now and keep the timeline;
++        // only resync when we are far behind (writer stalled or stopped).
++        else if (currentTick - nextTick_ < kMaxLateness)
++        {
++            do_read();
++        }
+         else
+         {
+             resync(std::chrono::duration_cast<std::chrono::nanoseconds>(currentTick - nextTick_));

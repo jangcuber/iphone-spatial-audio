@@ -1,0 +1,786 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index ef2252da..280704fc 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -39,7 +39,12 @@ if(TIDY)
+   endif()
+ endif()
+ 
+-if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
++if(${CMAKE_SYSTEM_NAME} MATCHES "iOS")
++  # 탈옥 iOS(Dopamine, rootless): macOS 코드 경로를 쓰되 macOS 전용 API는 IOS로 막는다
++  set(MACOSX TRUE)
++  set(IOS TRUE)
++  add_compile_definitions(IOS)
++elseif(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
+   set(MACOSX TRUE)
+ elseif(${CMAKE_SYSTEM_NAME} MATCHES "FreeBSD")
+   set(FREEBSD TRUE)
+@@ -215,8 +220,10 @@ if(NOT WIN32 AND NOT ANDROID)
+     endif(BONJOUR_FOUND)
+ 
+     add_compile_definitions(FREEBSD MACOS HAS_DAEMON)
+-    link_directories("/usr/local/lib")
+-    list(APPEND INCLUDE_DIRS "/usr/local/include")
++    if(NOT IOS)
++      link_directories("/usr/local/lib")
++      list(APPEND INCLUDE_DIRS "/usr/local/include")
++    endif()
+   else()
+ 
+     include(FindPkgConfig)
+diff --git a/client/CMakeLists.txt b/client/CMakeLists.txt
+index c0bbf34e..258ec865 100644
+--- a/client/CMakeLists.txt
++++ b/client/CMakeLists.txt
+@@ -24,12 +24,17 @@ if(MACOSX)
+   # CoreAudio
+   add_compile_definitions(HAS_COREAUDIO)
+   list(APPEND CLIENT_SOURCES player/coreaudio_player.cpp)
+-  find_library(COREAUDIO_LIB CoreAudio)
+-  find_library(COREFOUNDATION_LIB CoreFoundation)
+-  find_library(IOKIT_LIB IOKit)
+-  find_library(AUDIOTOOLBOX_LIB AudioToolbox)
+-  list(APPEND CLIENT_LIBRARIES ${COREAUDIO_LIB} ${COREFOUNDATION_LIB}
+-       ${IOKIT_LIB} ${AUDIOTOOLBOX_LIB})
++  if(IOS)
++    list(APPEND CLIENT_LIBRARIES "-framework CoreFoundation" "-framework AudioToolbox"
++         "-framework AVFAudio" "-framework IOKit" objc)
++  else()
++    find_library(COREAUDIO_LIB CoreAudio)
++    find_library(COREFOUNDATION_LIB CoreFoundation)
++    find_library(IOKIT_LIB IOKit)
++    find_library(AUDIOTOOLBOX_LIB AudioToolbox)
++    list(APPEND CLIENT_LIBRARIES ${COREAUDIO_LIB} ${COREFOUNDATION_LIB}
++         ${IOKIT_LIB} ${AUDIOTOOLBOX_LIB})
++  endif()
+ elseif(WIN32)
+   list(APPEND CLIENT_SOURCES player/wasapi_player.cpp)
+   list(
+diff --git a/client/client_settings.hpp b/client/client_settings.hpp
+index 6edeee78..0b02b725 100644
+--- a/client/client_settings.hpp
++++ b/client/client_settings.hpp
+@@ -106,6 +106,12 @@ struct ClientSettings
+         SharingMode sharing_mode{SharingMode::unspecified};
+         /// Mixer settings
+         Mixer mixer;
++        /// 소스 채널 하나만 모든 출력에 재생 (-1 = 끔)
++        int channel{-1};
++        /// --channel 출력 스피커: 0 = 둘 다, 1 = 왼쪽(큐 채널 0)만, 2 = 오른쪽(큐 채널 1)만
++        int speaker{0};
++        /// iOS CoreAudio: 0 = 재생 위치(mSampleTime)를 그대로, 1 = 그 값의 시각(mHostTime)부터 지금까지 흐른 만큼 보정
++        int dac_mode{0};
+     };
+ 
+     /// Log settings
+diff --git a/client/player/coreaudio_player.cpp b/client/player/coreaudio_player.cpp
+index a2055de3..cb46f2fb 100644
+--- a/client/player/coreaudio_player.cpp
++++ b/client/player/coreaudio_player.cpp
+@@ -23,7 +23,18 @@
+ #include "common/aixlog.hpp"
+ 
+ // 3rd party headers
++#ifdef IOS
++#include <AudioToolbox/AudioToolbox.h>
++#include <CoreFoundation/CoreFoundation.h>
++#include <objc/message.h>
++#include <objc/runtime.h>
++extern "C" void* objc_autoreleasePoolPush(void);
++extern "C" void objc_autoreleasePoolPop(void*);
++#else
+ #include <CoreAudio/CoreAudio.h>
++#endif
++#include <cstring>
++#include <mach/mach_time.h>
+ 
+ namespace player
+ {
+@@ -50,12 +61,19 @@ CoreAudioPlayer::CoreAudioPlayer(boost::asio::io_context& io_context, const Clie
+ 
+ CoreAudioPlayer::~CoreAudioPlayer()
+ {
++    // 재생 스레드가 scratch_ 등 이 클래스의 멤버를 쓰므로, 멤버가 소멸되기 전에 멈춘다
++    // (~Player에서 멈추면 이미 소멸된 scratch_에 써서 재접속 때 SIGSEGV — 2026-10-08 sa3 첫 빌드)
++    stop(); // NOLINT
+ }
+ 
+ 
+ /// TODO: experimental. No output device can be configured yet.
+ std::vector<PcmDevice> CoreAudioPlayer::pcm_list()
+ {
++#ifdef IOS
++    // iOS에는 macOS의 오디오 장치 열거 API가 없다. 현재 출력 route(내장 스피커 등) 하나만 쓴다.
++    return {PcmDevice(0, "default", "Current iOS audio route")};
++#else
+     UInt32 propsize;
+ 
+     AudioObjectPropertyAddress theAddress = {kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMaster};
+@@ -96,24 +114,60 @@ std::vector<PcmDevice> CoreAudioPlayer::pcm_list()
+     }
+     delete[] devids;
+     return result;
++#endif
+ }
+ 
+ 
+ void CoreAudioPlayer::playerCallback(AudioQueueRef queue, AudioQueueBufferRef bufferRef)
+ {
+-    /// Estimate the playout delay by checking the number of frames left in the buffer
+-    /// and add ms_ (= complete buffer size). Based on trying.
++    /// Estimate the playout delay: frames still queued ahead of the play head, plus a fixed DAC delay.
++    /// 원래 코드는 (frames_ - mSampleTime % frames_) % frames_ 로 현재 버퍼의 남은 양을 추정했는데,
++    /// 콜백이 버퍼 경계 직전/직후에 불리면 값이 0 <-> frames_ 로 뒤집혀 지연이 정확히 버퍼 하나(100 ms)씩 튄다.
++    /// (iOS는 IO 버퍼 4096 frames가 4800과 맞지 않아 콜백 위상이 경계를 자주 넘는다)
++    /// 대신 큐에 넣은 총 프레임 수 - 재생된 프레임 수로 계산한다.
+     AudioTimeStamp timestamp;
+-    AudioQueueGetCurrentTime(queue, timeLine_, &timestamp, NULL);
+-    size_t bufferedFrames = (frames_ - ((uint64_t)timestamp.mSampleTime % frames_)) % frames_;
+-    size_t bufferedMs = bufferedFrames * 1000 / pubStream_->getFormat().rate() + (ms_ * (NUM_BUFFERS - 1));
+-    /// 15ms DAC delay. Based on trying.
+-    bufferedMs += 15;
+-    //    LOG(INFO, LOG_TAG) << "buffered: " << bufferedFrames << ", ms: " << bufferedMs << ", mSampleTime: " << timestamp.mSampleTime << "\n";
+-
+-    /// TODO: sometimes this bufferedMS or AudioTimeStamp wraps around 1s (i.e. we're 1s out of sync (behind)) and recovers later on
+-    chronos::usec delay(bufferedMs * 1000);
+-    char* buffer = (char*)bufferRef->mAudioData;
++    uint64_t playedFrames = 0;
++    if ((AudioQueueGetCurrentTime(queue, timeLine_, &timestamp, NULL) == noErr) && ((timestamp.mFlags & kAudioTimeStampSampleTimeValid) != 0) &&
++        (timestamp.mSampleTime > 0))
++        playedFrames = static_cast<uint64_t>(timestamp.mSampleTime);
++    // mSampleTime이 언제 시점의 값인지(mHostTime)와 지금의 차이. 재연결마다 폰별 고정 어긋남(2026-10-09, 13~15 ms)이
++    // 이 값이 세션마다 달라서인지 확인하고, dac_mode 1이면 그만큼 재생 위치를 지금으로 옮긴다.
++    int64_t staleUs = 0;
++    if ((playedFrames > 0) && ((timestamp.mFlags & kAudioTimeStampHostTimeValid) != 0))
++    {
++        static mach_timebase_info_data_t tb{0, 0};
++        if (tb.denom == 0)
++            mach_timebase_info(&tb);
++        const int64_t dt = static_cast<int64_t>(mach_absolute_time() - timestamp.mHostTime);
++        staleUs = dt * static_cast<int64_t>(tb.numer) / static_cast<int64_t>(tb.denom) / 1000;
++        if ((settings_.dac_mode == 1) && (staleUs > -200000) && (staleUs < 200000))
++        {
++            const int64_t adj = staleUs * static_cast<int64_t>(pubStream_->getFormat().rate()) / 1000000;
++            playedFrames = static_cast<uint64_t>(std::max<int64_t>(0, static_cast<int64_t>(playedFrames) + adj));
++        }
++    }
++    if (playedFrames > enqueuedFrames_)
++    {
++        // underrun: 재생 시계가 넣은 양을 앞질렀다. 큐는 비어 있는 것으로 보고 기준을 맞춘다
++        LOG(DEBUG, LOG_TAG) << "Queue underrun by " << (playedFrames - enqueuedFrames_) << " frames\n";
++        enqueuedFrames_ = playedFrames;
++    }
++    else if (enqueuedFrames_ - playedFrames > static_cast<uint64_t>(NUM_BUFFERS) * frames_ + pubStream_->getFormat().rate())
++    {
++        // 재생 시계가 크게 되돌아갔다(timeline discontinuity 등). 기준을 다시 잡는다.
++        // (iOS는 버퍼를 IO 버퍼로 복사한 뒤 콜백하므로 mSampleTime이 IO 버퍼(~85 ms)만큼 뒤처져 NUM_BUFFERS * frames_를 넘는 것은 정상)
++        LOG(INFO, LOG_TAG) << "Queue timeline discontinuity, played: " << playedFrames << ", enqueued: " << enqueuedFrames_ << "\n";
++        enqueuedFrames_ = playedFrames + static_cast<uint64_t>(NUM_BUFFERS - 1) * frames_;
++    }
++    const uint64_t bufferedFrames = enqueuedFrames_ - playedFrames;
++    /// 15ms DAC delay. Based on trying. (ms 단위로 자르지 않고 µs로 계산)
++    chronos::usec delay(static_cast<int64_t>(bufferedFrames * 1000000 / pubStream_->getFormat().rate()) + 15000);
++    if (++callbacks_ % 10 == 0)
++        LOG(DEBUG, "Dac") << staleUs << "\t" << bufferedFrames << "\t" << delay.count() << "\t" << settings_.dac_mode << "\n";
++    //    LOG(INFO, LOG_TAG) << "buffered: " << bufferedFrames << ", delay: " << delay.count() << " us, mSampleTime: " << timestamp.mSampleTime << "\n";
++
++    // --channel: 소스 전체 채널로 받아 scratch에 두고, 고른 채널만 2채널 큐 버퍼로 옮긴다
++    char* buffer = select_ ? scratch_.data() : (char*)bufferRef->mAudioData;
+     if (!pubStream_->getPlayerChunkOrSilence(buffer, delay, frames_))
+     {
+         if (chronos::getTickCount() - lastChunkTick > 5000)
+@@ -129,9 +183,12 @@ void CoreAudioPlayer::playerCallback(AudioQueueRef queue, AudioQueueBufferRef bu
+         lastChunkTick = chronos::getTickCount();
+         adjustVolume(buffer, frames_);
+     }
++    if (select_)
++        selectChannel(buffer, (char*)bufferRef->mAudioData, frames_);
+ 
+     //    OSStatus status =
+     AudioQueueEnqueueBuffer(queue, bufferRef, 0, NULL);
++    enqueuedFrames_ += frames_;
+ 
+     if (!active_)
+     {
+@@ -140,6 +197,33 @@ void CoreAudioPlayer::playerCallback(AudioQueueRef queue, AudioQueueBufferRef bu
+ }
+ 
+ 
++/// --channel N: 소스의 N번 채널만 골라 2채널 출력(아이폰 상/하단 스피커)에 똑같이 내보낸다.
++/// 한 폰 = 한 공간 채널. 7채널 스트림 하나를 7대가 공유하면 모든 폰이 같은 시간축을 쓴다.
++/// 큐는 항상 2채널로 연다: 7채널 큐를 열면 iOS가 내장 스피커용으로 멀티채널을 렌더링해
++/// 같은 소리가 약 7 ms 간격으로 두 번 나왔다 (2026-10-08 폰 4대 측정, 녹음에서 확인).
++void CoreAudioPlayer::selectChannel(const char* src, char* dst, size_t frames)
++{
++    const SampleFormat& sf = pubStream_->getFormat();
++    const size_t ss = sf.sampleSize();
++    const size_t fs = sf.frameSize();
++    const size_t off = static_cast<size_t>(settings_.channel) * ss;
++    for (size_t f = 0; f < frames; ++f)
++    {
++        const char* in = src + f * fs + off;
++        char* out = dst + f * 2 * ss;
++        // 아이폰 위/아래 스피커는 지연이 약 7 ms 달라 둘 다 내면 같은 소리가 두 번 들린다 (2026-10-08 녹음) → --speaker로 하나만
++        if (settings_.speaker == 2)
++            std::memset(out, 0, ss);
++        else
++            std::memcpy(out, in, ss);
++        if (settings_.speaker == 1)
++            std::memset(out + ss, 0, ss);
++        else
++            std::memcpy(out + ss, in, ss);
++    }
++}
++
++
+ bool CoreAudioPlayer::needsThread() const
+ {
+     return true;
+@@ -154,7 +238,12 @@ void CoreAudioPlayer::worker()
+         {
+             try
+             {
+-                initAudioQueue();
++#ifdef IOS
++                if (settings_.dac_mode == 2)
++                    runRemoteIO();
++                else
++#endif
++                    initAudioQueue();
+             }
+             catch (const std::exception& e)
+             {
+@@ -166,8 +255,151 @@ void CoreAudioPlayer::worker()
+     }
+ }
+ 
++#ifdef IOS
++/// 데몬에서도 무음 스위치와 무관하게 스피커로 재생되도록 AVAudioSession을 Playback으로 설정한다.
++/// (ObjC 컴파일러 없이 objc 런타임으로 호출. 실패해도 로그만 남기고 계속 진행)
++static double g_outputLatencySec = 0.0;
++static void configureIosAudioSession()
++{
++    static bool done = false;
++    if (done)
++        return;
++    done = true;
++    void* pool = objc_autoreleasePoolPush();
++    Class cls = objc_getClass("AVAudioSession");
++    if (cls == nullptr)
++    {
++        LOG(WARNING, LOG_TAG) << "AVAudioSession class not found\n";
++        objc_autoreleasePoolPop(pool);
++        return;
++    }
++    id session = ((id(*)(Class, SEL))objc_msgSend)(cls, sel_registerName("sharedInstance"));
++    id err = nullptr;
++    // AVAudioSessionCategoryOptionMixWithOthers = 1
++    BOOL okCat = ((BOOL(*)(id, SEL, id, unsigned long, id*))objc_msgSend)(session, sel_registerName("setCategory:withOptions:error:"),
++                                                                      (id)CFSTR("AVAudioSessionCategoryPlayback"), 1UL, &err);
++    BOOL okAct = ((BOOL(*)(id, SEL, BOOL, id*))objc_msgSend)(session, sel_registerName("setActive:error:"), YES, &err);
++    double rate = ((double(*)(id, SEL))objc_msgSend)(session, sel_registerName("sampleRate"));
++    // RemoteIO(dac-mode 2)는 콜백이 작을수록 반응이 빠르다. 잠금 상태에서는 iOS가 더 크게 바꿀 수 있다
++    ((BOOL(*)(id, SEL, double, id*))objc_msgSend)(session, sel_registerName("setPreferredIOBufferDuration:error:"), 0.02, &err);
++    double outLat = ((double(*)(id, SEL))objc_msgSend)(session, sel_registerName("outputLatency"));
++    g_outputLatencySec = outLat;
++    double ioBuf = ((double(*)(id, SEL))objc_msgSend)(session, sel_registerName("IOBufferDuration"));
++    LOG(INFO, LOG_TAG) << "AVAudioSession category=" << (okCat ? "ok" : "FAILED") << " active=" << (okAct ? "ok" : "FAILED") << " sampleRate=" << rate
++                       << " outputLatency=" << outLat * 1000 << "ms ioBuffer=" << ioBuf * 1000 << "ms\n";
++    objc_autoreleasePoolPop(pool);
++}
++#endif
++
++#ifdef IOS
++static OSStatus rioRender(void* ref, AudioUnitRenderActionFlags* flags, const AudioTimeStamp* ts, UInt32 bus, UInt32 frames, AudioBufferList* io)
++{
++    (void)flags;
++    (void)bus;
++    return static_cast<CoreAudioPlayer*>(ref)->renderCallback(ts, frames, io);
++}
++
++
++/// RemoteIO render 콜백: ts->mHostTime = 이 버퍼 첫 샘플이 출력 하드웨어로 나가는 시각, 여기에 outputLatency(스피커까지)를 더한다.
++/// AudioQueue는 큐 시간축과 실제 출력 사이 시작 위상이 큐를 열 때마다 달라 재연결마다 폰별로 수~15 ms 고정 어긋남이 생겼다(2026-10-09).
++OSStatus CoreAudioPlayer::renderCallback(const AudioTimeStamp* ts, UInt32 frames, AudioBufferList* io)
++{
++    static mach_timebase_info_data_t tb{0, 0};
++    if (tb.denom == 0)
++        mach_timebase_info(&tb);
++    const SampleFormat& sf = pubStream_->getFormat();
++    char* out = static_cast<char*>(io->mBuffers[0].mData);
++    const size_t outFrameSize = (select_ ? 2 : sf.channels()) * sf.sampleSize();
++    if ((frames * sf.frameSize() > scratch_.size()) || (io->mBuffers[0].mDataByteSize < frames * outFrameSize))
++    {
++        std::memset(out, 0, io->mBuffers[0].mDataByteSize);
++        return noErr;
++    }
++    int64_t aheadUs = 0;
++    if ((ts->mFlags & kAudioTimeStampHostTimeValid) != 0)
++    {
++        const int64_t dt = static_cast<int64_t>(ts->mHostTime) - static_cast<int64_t>(mach_absolute_time());
++        aheadUs = dt * static_cast<int64_t>(tb.numer) / static_cast<int64_t>(tb.denom) / 1000;
++    }
++    chronos::usec delay(aheadUs + static_cast<int64_t>(outputLatencyUs_));
++    if (++callbacks_ % 50 == 0)
++        LOG(DEBUG, "Dac") << aheadUs << "\t" << frames << "\t" << delay.count() << "\t" << settings_.dac_mode << "\t" << outputLatencyUs_ << "\t"
++                          << ts->mFlags << "\n";
++    char* buffer = select_ ? scratch_.data() : out;
++    if (!pubStream_->getPlayerChunkOrSilence(buffer, delay, frames))
++    {
++        if (chronos::getTickCount() - lastChunkTick > 5000)
++            rioIdle_ = true;
++    }
++    else
++    {
++        lastChunkTick = chronos::getTickCount();
++        adjustVolume(buffer, frames);
++    }
++    if (select_)
++        selectChannel(buffer, out, frames);
++    return noErr;
++}
++
++
++void CoreAudioPlayer::runRemoteIO()
++{
++    configureIosAudioSession();
++    outputLatencyUs_ = g_outputLatencySec * 1e6;
++    const SampleFormat& sf = pubStream_->getFormat();
++    select_ = (settings_.channel >= 0) && (settings_.channel < sf.channels()) && (sf.channels() >= 2);
++    const uint32_t outChannels = select_ ? 2 : sf.channels();
++    const UInt32 maxFrames = 8192;
++    scratch_.assign(static_cast<size_t>(maxFrames) * sf.frameSize(), 0);
++
++    AudioComponentDescription desc{kAudioUnitType_Output, kAudioUnitSubType_RemoteIO, kAudioUnitManufacturer_Apple, 0, 0};
++    AudioComponent comp = AudioComponentFindNext(nullptr, &desc);
++    AudioUnit unit = nullptr;
++    if ((comp == nullptr) || (AudioComponentInstanceNew(comp, &unit) != noErr))
++        throw std::runtime_error("RemoteIO not available");
++
++    AudioStreamBasicDescription format{};
++    format.mSampleRate = sf.rate();
++    format.mFormatID = kAudioFormatLinearPCM;
++    format.mFormatFlags = kLinearPCMFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
++    format.mBitsPerChannel = sf.bits();
++    format.mChannelsPerFrame = outChannels;
++    format.mBytesPerFrame = outChannels * sf.sampleSize();
++    format.mFramesPerPacket = 1;
++    format.mBytesPerPacket = format.mBytesPerFrame;
++    AURenderCallbackStruct cb{rioRender, this};
++    OSStatus st = AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &format, sizeof(format));
++    if (st == noErr)
++        st = AudioUnitSetProperty(unit, kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitScope_Global, 0, &maxFrames, sizeof(maxFrames));
++    if (st == noErr)
++        st = AudioUnitSetProperty(unit, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0, &cb, sizeof(cb));
++    if (st == noErr)
++        st = AudioUnitInitialize(unit);
++    lastChunkTick = chronos::getTickCount();
++    rioIdle_ = false;
++    callbacks_ = 0;
++    if (st == noErr)
++        st = AudioOutputUnitStart(unit);
++    LOG(INFO, LOG_TAG) << "RemoteIO start=" << st << ", channels: " << outChannels << ", outputLatency: " << outputLatencyUs_ / 1000. << " ms"
++                       << (select_ ? " (source channel " + std::to_string(settings_.channel) + ", speaker " + std::to_string(settings_.speaker) + ")" : std::string()) << "\n";
++    while ((st == noErr) && active_ && !rioIdle_)
++        chronos::sleep(100);
++    if (rioIdle_)
++        LOG(NOTICE, LOG_TAG) << "No chunk received for 5000ms. Stopping RemoteIO.\n";
++    AudioOutputUnitStop(unit);
++    AudioUnitUninitialize(unit);
++    AudioComponentInstanceDispose(unit);
++    pubStream_->clearChunks();
++    if (st != noErr)
++        throw std::runtime_error("RemoteIO setup failed: " + std::to_string(st));
++}
++#endif
++
+ void CoreAudioPlayer::initAudioQueue()
+ {
++#ifdef IOS
++    configureIosAudioSession();
++#endif
+     const SampleFormat& sampleFormat = pubStream_->getFormat();
+ 
+     AudioStreamBasicDescription format;
+@@ -175,8 +407,11 @@ void CoreAudioPlayer::initAudioQueue()
+     format.mFormatID = kAudioFormatLinearPCM;
+     format.mFormatFlags = kLinearPCMFormatFlagIsSignedInteger; // | kAudioFormatFlagIsPacked;
+     format.mBitsPerChannel = sampleFormat.bits();
+-    format.mChannelsPerFrame = sampleFormat.channels();
+-    format.mBytesPerFrame = sampleFormat.frameSize();
++    select_ = (settings_.channel >= 0) && (settings_.channel < sampleFormat.channels()) && (sampleFormat.channels() >= 2);
++    const uint32_t outChannels = select_ ? 2 : sampleFormat.channels();
++    const uint32_t outFrameSize = outChannels * sampleFormat.sampleSize();
++    format.mChannelsPerFrame = outChannels;
++    format.mBytesPerFrame = outFrameSize;
+     format.mFramesPerPacket = 1;
+     format.mBytesPerPacket = format.mBytesPerFrame * format.mFramesPerPacket;
+     format.mReserved = 0;
+@@ -194,10 +429,13 @@ void CoreAudioPlayer::initAudioQueue()
+     // frames: 4800, ms: 100, buffer size: 19200
+     frames_ = (sampleFormat.rate() * ms_) / 1000;
+     ms_ = frames_ * 1000 / sampleFormat.rate();
+-    buff_size_ = frames_ * sampleFormat.frameSize();
+-    LOG(INFO, LOG_TAG) << "frames: " << frames_ << ", ms: " << ms_ << ", buffer size: " << buff_size_ << "\n";
++    buff_size_ = frames_ * outFrameSize;
++    scratch_.assign(select_ ? frames_ * sampleFormat.frameSize() : 0, 0);
++    LOG(INFO, LOG_TAG) << "frames: " << frames_ << ", ms: " << ms_ << ", buffer size: " << buff_size_ << ", queue channels: " << outChannels
++                       << (select_ ? " (source channel " + std::to_string(settings_.channel) + ", speaker " + std::to_string(settings_.speaker) + ")" : std::string()) << "\n";
+ 
+     AudioQueueBufferRef buffers[NUM_BUFFERS];
++    enqueuedFrames_ = 0;
+     for (int i = 0; i < NUM_BUFFERS; i++)
+     {
+         AudioQueueAllocateBuffer(queue, buff_size_, &buffers[i]);
+diff --git a/client/player/coreaudio_player.hpp b/client/player/coreaudio_player.hpp
+index b22cc42d..6162babc 100644
+--- a/client/player/coreaudio_player.hpp
++++ b/client/player/coreaudio_player.hpp
+@@ -24,6 +24,9 @@
+ 
+ // 3rd party headers
+ #include <AudioToolbox/AudioQueue.h>
++#include <atomic>
++#include <string>
++#include <vector>
+ #include <CoreAudio/CoreAudioTypes.h>
+ #include <CoreFoundation/CFRunLoop.h>
+ 
+@@ -52,6 +55,7 @@ public:
+ 
+     /// Callback funtion for audio data to be played
+     void playerCallback(AudioQueueRef queue, AudioQueueBufferRef bufferRef);
++    void selectChannel(const char* src, char* dst, size_t frames);
+     /// @return list of available pcm devices
+     static std::vector<PcmDevice> pcm_list();
+ 
+@@ -61,11 +65,26 @@ private:
+ 
+     void initAudioQueue();
+     void uninitAudioQueue(AudioQueueRef queue);
++#ifdef IOS
++public:
++    /// --dac-mode 2: AudioUnit(RemoteIO) render 콜백. 콜백 시각표(mHostTime)가 이 버퍼가 출력될 시각을 알려 준다
++    OSStatus renderCallback(const AudioTimeStamp* ts, UInt32 frames, AudioBufferList* io);
++private:
++    void runRemoteIO();
++    double outputLatencyUs_{0};
++    std::atomic<bool> rioIdle_{false};
++#endif
+ 
+     AudioQueueTimelineRef timeLine_;
+     size_t ms_;
+     size_t frames_;
++    /// 큐에 넣은 총 프레임 수 (큐 시작 이후). 재생 위치(mSampleTime)와 빼서 큐 안의 남은 양을 구한다
++    uint64_t enqueuedFrames_{0};
++    uint32_t callbacks_{0};
+     size_t buff_size_;
++    /// --channel 사용 중이면 true: 큐는 2채널, 소스 전체 채널은 scratch_에 받는다
++    bool select_{false};
++    std::vector<char> scratch_;
+     std::shared_ptr<Stream> pubStream_;
+     long lastChunkTick;
+ };
+diff --git a/client/snapclient.cpp b/client/snapclient.cpp
+index 08e62c40..84958a03 100644
+--- a/client/snapclient.cpp
++++ b/client/snapclient.cpp
+@@ -191,6 +191,10 @@ int main(int argc, char** argv)
+         op.add<Value<string>>("s", "soundcard", "Index or name of the PCM device", pcm_device, &pcm_device);
+ #endif
+         op.add<Value<int>>("", "latency", "Latency of the PCM device", 0, &settings.player.latency);
++        op.add<Value<int>>("", "channel", "Play only this source channel (0-based) on all outputs, -1 = all", -1, &settings.player.channel);
++        op.add<Value<int>>("", "speaker", "With --channel: 0 = both speakers, 1 = left output only, 2 = right output only", 0, &settings.player.speaker);
++        op.add<Value<int>>("", "dac-mode", "CoreAudio (iOS) play position: 0 = AudioQueue sample time, 1 = AudioQueue extrapolated with host time, 2 = AudioUnit RemoteIO render time stamps", 0,
++                           &settings.player.dac_mode);
+ #ifdef HAS_SOXR
+         auto sample_format = op.add<Value<string>>("", "sampleformat", "Resample audio stream to <rate>:<bits>:<channels>", "");
+ #endif
+diff --git a/client/stream.cpp b/client/stream.cpp
+index 09b6c1ed..5ecbf84e 100644
+--- a/client/stream.cpp
++++ b/client/stream.cpp
+@@ -440,7 +440,7 @@ bool Stream::getPlayerChunk(void* outputBuffer, const cs::usec& outputBufferDacT
+             median_ = buffer_.median();
+             shortMedian_ = shortBuffer_.median();
+             LOG(DEBUG, "Stats") << "Chunk: " << age.count() / 100 << "\t" << miniBuffer_.median() / 100 << "\t" << shortMedian_ / 100 << "\t" << median_ / 100
+-                                << "\t" << buffer_.size() << "\t" << cs::duration<cs::msec>(outputBufferDacTime) << "\t" << frame_delta_ << "\n";
++                                << "\t" << buffer_.size() << "\t" << cs::duration<cs::msec>(outputBufferDacTime) << "\t" << frame_delta_ << "\t" << TimeProvider::getInstance().getDiffToServer<cs::usec>().count() << "\n";
+             frame_delta_ = 0;
+ 
+ #ifdef LOG_LATENCIES
+diff --git a/client/time_provider.cpp b/client/time_provider.cpp
+index d6478c27..d1cadf04 100644
+--- a/client/time_provider.cpp
++++ b/client/time_provider.cpp
+@@ -19,6 +19,14 @@
+ // prototype/interface header file
+ #include "time_provider.hpp"
+ 
++#include <algorithm>
++#include <cstdlib>
++#include <cstdio>
++#include <ctime>
++#include <string>
++#include <cmath>
++#include <vector>
++
+ // local headers
+ #include "common/aixlog.hpp"
+ 
+@@ -39,11 +47,13 @@ void TimeProvider::setDiff(const tv& c2s, const tv& s2c)
+     //	double diff = (latency.sec * 1000. + latency.usec / 1000.) / 2.;
+     double diff = (static_cast<double>(c2s.sec) / 2. - static_cast<double>(s2c.sec) / 2.) * 1000. +
+                   (static_cast<double>(c2s.usec) / 2. - static_cast<double>(s2c.usec) / 2.) / 1000.;
+-    setDiffToServer(diff);
++    // 왕복 시간 = c2s + s2c (두 시계 차이는 상쇄된다)
++    double rtt = (static_cast<double>(c2s.sec) + static_cast<double>(s2c.sec)) * 1000. + (static_cast<double>(c2s.usec) + static_cast<double>(s2c.usec)) / 1000.;
++    setDiffToServer(diff, rtt);
+ }
+ 
+ 
+-void TimeProvider::setDiffToServer(double ms)
++void TimeProvider::setDiffToServer(double ms, double rttMs)
+ {
+     using namespace std::chrono_literals;
+     auto now = std::chrono::system_clock::now();
+@@ -56,13 +66,147 @@ void TimeProvider::setDiffToServer(double ms)
+         LOG(INFO, LOG_TAG) << "Last time sync older than a minute. Clearing time buffer\n";
+         diffToServer_ = static_cast<chronos::usec::rep>(ms * 1000);
+         diffBuffer_.clear();
++        samples_.clear();
++        recentRtt_.clear();
++        upCount_ = 0;
+     }
+     lastTimeSync = now;
+ 
+     diffBuffer_.add(static_cast<chronos::usec::rep>(ms * 1000));
+-    diffToServer_ = diffBuffer_.median();
+-    // LOG(INFO, LOG_TAG) << "setDiffToServer: " << ms << ", diff: " << diffToServer_ / 1000000 << " s, " << (diffToServer_ / 1000) % 1000 << "." <<
+-    // diffToServer_ % 1000 << " ms\n";
++    // 기본은 원래 snapcast 방식(전체 표본 중앙값). 최소 왕복 + 직선 방식(sa10~13)은 재생 중(Wi-Fi 내려받기 부하)
++    // 값이 수 ms씩 흘러 같은 연결 안의 보정이 1~2 ms 틀어졌다(2026-10-09 의자 보정 2·3회차). SNAP_TIMESYNC=rtt면 그 방식.
++    static const std::string mode = (getenv("SNAP_TIMESYNC") != nullptr) ? std::string(getenv("SNAP_TIMESYNC")) : std::string("up");
++    const bool useRtt = (mode == "rtt");
++    if ((mode != "median") && !useRtt && (rttMs >= 0))
++    {
++        // 기본(sa16, 2026-10-09): 폰→Mac 한 방향(c2s = diff + 왕복/2)으로 계산한다.
++        // 7대가 7채널 PCM을 받으면 Mac→폰 방향만 8~10 ms 밀려(소리 데이터 뒤에 줄 섬) 중앙값 방식은 재생 중 4~6 ms 흘렀다.
++        // 폰→Mac 방향은 거의 그대로라서, c2s 하위 10%(최근 20초) − 한가할 때의 왕복 바닥/2 로 쓴다(기록 모의: 흔들림 σ 0.1~0.4 ms).
++        const int64_t tnow = std::chrono::duration_cast<chronos::usec>(chronos::clk::now().time_since_epoch()).count();
++        const int64_t rttUs = static_cast<int64_t>(rttMs * 1000);
++        samples_.push_back({tnow, static_cast<int64_t>(ms * 1000), rttUs});
++        while (!samples_.empty() && (tnow - samples_.front().t_us > 20000000) && (samples_.size() > 10))
++            samples_.pop_front();
++        // 왕복 바닥: 최근 10개 중 두 번째로 짧은 값의 최솟값(튀는 값 하나는 무시). 재접속·재시작에도 남게 파일에 둔다(24시간).
++        static const char* floorFile = "/var/mobile/Library/Caches/snapclient_rttfloor";
++        if (rttFloorUs_ < 0)
++        {
++            if (FILE* f = fopen(floorFile, "r"))
++            {
++                long long v = -1, when = 0;
++                if ((fscanf(f, "%lld %lld", &v, &when) == 2) && (v > 0) && (time(nullptr) - when < 86400))
++                    rttFloorUs_ = v;
++                fclose(f);
++            }
++        }
++        recentRtt_.push_back(rttUs);
++        while (recentRtt_.size() > 10)
++            recentRtt_.pop_front();
++        if (recentRtt_.size() >= 2)
++        {
++            std::vector<int64_t> r(recentRtt_.begin(), recentRtt_.end());
++            std::sort(r.begin(), r.end());
++            if ((rttFloorUs_ < 0) || (r[1] < rttFloorUs_))
++            {
++                rttFloorUs_ = r[1];
++                if (FILE* f = fopen(floorFile, "w"))
++                {
++                    fprintf(f, "%lld %lld\n", static_cast<long long>(rttFloorUs_), static_cast<long long>(time(nullptr)));
++                    fclose(f);
++                }
++            }
++        }
++        const int64_t floorUs = (rttFloorUs_ > 0) ? rttFloorUs_ : rttUs;
++        std::vector<int64_t> c2s;
++        for (const auto& x : samples_)
++            c2s.push_back(x.diff_us + x.rtt_us / 2);
++        std::sort(c2s.begin(), c2s.end());
++        int64_t est = c2s[c2s.size() / 10] - floorUs / 2;
++        // 처음 20개 이후에는 한 번에 0.1 ms까지만 (튀는 값 방지; 1초마다 표본이라 100 ppm까지 따라감)
++        if (++upCount_ > 20)
++        {
++            const int64_t prev = diffToServer_.load();
++            est = std::max(prev - 100, std::min(prev + 100, est));
++        }
++        diffToServer_ = est;
++        LOG(DEBUG, "TimeSync") << static_cast<int64_t>(ms * 1000) << "\t" << rttUs << "\t" << est << "\t" << floorUs << "\n";
++        return;
++    }
++    if (!useRtt)
++    {
++        diffToServer_ = diffBuffer_.median();
++        LOG(DEBUG, "TimeSync") << static_cast<int64_t>(ms * 1000) << "\t" << static_cast<int64_t>(rttMs * 1000) << "\t" << diffToServer_.load() << "\n";
++        return;
++    }
++    if (rttMs < 0)
++    {
++        diffToServer_ = diffBuffer_.median();
++        return;
++    }
++
++    // 왕복 시간이 가장 짧은 1/4 표본만으로 직선(diff = a + b·t)을 맞춰 지금 값을 쓴다.
++    // Wi-Fi는 한쪽 방향만 늦는 경우가 많아(폰 절전 등) 전체 중앙값은 재연결마다 수 ms씩 달라졌다(2026-10-09 실측).
++    // 직선은 폰과 Mac 시계의 속도 차(수~수십 ppm)를 따라가기 위함.
++    const int64_t tnow = std::chrono::duration_cast<chronos::usec>(chronos::clk::now().time_since_epoch()).count();
++    samples_.push_back({tnow, static_cast<int64_t>(ms * 1000), static_cast<int64_t>(rttMs * 1000)});
++    while (samples_.size() > 200)
++        samples_.pop_front();
++
++    // 표본이 60초 넘게 쌓이기 전에는 기울기를 모르므로 최근 15초 표본만 쓴다 (폰·Mac 시계 속도 차 10~20 ppm 때문에
++    // 오래된 표본을 섞으면 1분 안에 1 ms 가까이 뒤처진다: 2026-10-09 11:43 의자 보정, 같은 연결 안에서 1~1.5 ms 이동)
++    const bool longSpan = (samples_.back().t_us - samples_.front().t_us) > 60000000;
++    std::vector<Sample> sel;
++    for (const auto& x : samples_)
++        if (longSpan || (tnow - x.t_us < 15000000))
++            sel.push_back(x);
++    std::sort(sel.begin(), sel.end(), [](const Sample& a, const Sample& b) { return a.rtt_us < b.rtt_us; });
++    size_t k = std::max<size_t>(std::min<size_t>(sel.size(), 5), sel.size() / (longSpan ? 4 : 3));
++    sel.resize(k);
++    // 시계 속도 차(기울기)는 표본이 60초 넘게 퍼져 있을 때만 쓴다. 연결 직후 몇 초짜리 표본으로 기울기를 잡으면
++    // 지금 값으로 늘릴 때 수 ms씩 튀어 재생 중 재동기화가 났다(2026-10-09 11:26~11:28, sa10).
++    int64_t tmin = tnow, tmax = 0;
++    for (const auto& x : sel)
++    {
++        tmin = std::min(tmin, x.t_us);
++        tmax = std::max(tmax, x.t_us);
++    }
++    double slope = 0.;
++    if (tmax - tmin > 60000000)
++    {
++        double st = 0, sd = 0;
++        for (const auto& x : sel)
++        {
++            st += static_cast<double>(x.t_us - tnow);
++            sd += static_cast<double>(x.diff_us - sel[0].diff_us);
++        }
++        st /= static_cast<double>(k);
++        sd /= static_cast<double>(k);
++        double num = 0, den = 0;
++        for (const auto& x : sel)
++        {
++            const double dt = static_cast<double>(x.t_us - tnow) - st;
++            num += dt * (static_cast<double>(x.diff_us - sel[0].diff_us) - sd);
++            den += dt * dt;
++        }
++        slope = (den > 0) ? num / den : 0.;
++        if (std::abs(slope) > 1e-4) // 100 ppm 넘으면 믿지 않는다
++            slope = 0.;
++    }
++    // 고른 표본을 지금 시각으로 옮긴 뒤 중앙값 (직선 맞춤보다 튀는 표본에 강하다)
++    std::vector<int64_t> d;
++    for (const auto& x : sel)
++        d.push_back(x.diff_us - static_cast<int64_t>(slope * static_cast<double>(x.t_us - tnow)));
++    std::nth_element(d.begin(), d.begin() + d.size() / 2, d.end());
++    int64_t est = d[d.size() / 2];
++    // 처음 20개 표본 이후에는 한 번에 0.1 ms 넘게 움직이지 않게 (재생 중 갑작스러운 점프 방지)
++    if (samples_.size() > 20)
++    {
++        const int64_t prev = diffToServer_.load();
++        est = std::max(prev - 100, std::min(prev + 100, est));
++    }
++    diffToServer_ = est;
++    // STATS=1 진단: 표본(µs), 왕복(µs), 현재 추정
++    LOG(DEBUG, "TimeSync") << static_cast<int64_t>(ms * 1000) << "\t" << static_cast<int64_t>(rttMs * 1000) << "\t" << est << "\n";
+ }
+ 
+ /*
+diff --git a/client/time_provider.hpp b/client/time_provider.hpp
+index 9fad4c90..fdc7020f 100644
+--- a/client/time_provider.hpp
++++ b/client/time_provider.hpp
+@@ -29,6 +29,7 @@
+ // standard headers
+ #include <atomic>
+ #include <chrono>
++#include <deque>
+ 
+ 
+ /// Provides local and server time
+@@ -48,7 +49,7 @@ public:
+     }
+ 
+     /// Set diff to server
+-    void setDiffToServer(double ms);
++    void setDiffToServer(double ms, double rttMs = -1.);
+     /// Set diff from round-trip-times client-to-server and server-to-client
+     void setDiff(const tv& c2s, const tv& s2c);
+ 
+@@ -95,5 +96,17 @@ private:
+     void operator=(TimeProvider const&); // Don't implement
+ 
+     DoubleBuffer<chronos::usec::rep> diffBuffer_;
++    /// 시계 맞춤 표본 (로컬 시각, diff, 왕복 시간). 왕복이 짧은 표본일수록 Wi-Fi 비대칭 오차가 작다
++    struct Sample
++    {
++        int64_t t_us;
++        int64_t diff_us;
++        int64_t rtt_us;
++    };
++    std::deque<Sample> samples_;
++    /// 최근 왕복(µs), 왕복 바닥(µs, -1 = 모름), up 방식 표본 수
++    std::deque<int64_t> recentRtt_;
++    int64_t rttFloorUs_{-1};
++    int upCount_{0};
+     std::atomic<chronos::usec::rep> diffToServer_;
+ };
+diff --git a/common/utils.hpp b/common/utils.hpp
+index 62a5798f..6d815f0b 100644
+--- a/common/utils.hpp
++++ b/common/utils.hpp
+@@ -42,8 +42,28 @@
+ #include <sys/sysinfo.h>
+ #endif
+ #ifdef MACOS
++#ifdef IOS
++// iOS SDK에는 IOKit 공개 헤더가 없다. 필요한 함수만 직접 선언 (IOKit.tbd에 심볼 존재)
++#include <CoreFoundation/CoreFoundation.h>
++#include <mach/mach.h>
++typedef mach_port_t io_object_t;
++typedef io_object_t io_registry_entry_t;
++extern "C"
++{
++    io_registry_entry_t IORegistryEntryFromPath(mach_port_t mainPort, const char* path);
++    CFTypeRef IORegistryEntryCreateCFProperty(io_registry_entry_t entry, CFStringRef key, CFAllocatorRef allocator, uint32_t options);
++    kern_return_t IOObjectRelease(io_object_t object);
++}
++#ifndef kIOMasterPortDefault
++#define kIOMasterPortDefault MACH_PORT_NULL
++#endif
++#ifndef kIOPlatformUUIDKey
++#define kIOPlatformUUIDKey "IOPlatformUUID"
++#endif
++#else
+ #include <IOKit/IOCFPlugIn.h>
+ #include <IOKit/IOTypes.h>
++#endif
+ #include <ifaddrs.h>
+ #include <net/if_dl.h>
+ #endif
+@@ -433,9 +453,12 @@ static std::string getHostId(const std::string& defaultId = "")
+     io_registry_entry_t ioRegistryRoot = IORegistryEntryFromPath(kIOMasterPortDefault, "IOService:/");
+     CFStringRef uuidCf = (CFStringRef)IORegistryEntryCreateCFProperty(ioRegistryRoot, CFSTR(kIOPlatformUUIDKey), kCFAllocatorDefault, 0);
+     IOObjectRelease(ioRegistryRoot);
+-    if (CFStringGetCString(uuidCf, buf, 64, kCFStringEncodingMacRoman))
+-        result = buf;
+-    CFRelease(uuidCf);
++    if (uuidCf != nullptr)
++    {
++        if (CFStringGetCString(uuidCf, buf, 64, kCFStringEncodingMacRoman))
++            result = buf;
++        CFRelease(uuidCf);
++    }
+ #elif ANDROID
+     result = getProp("ro.serialno");
+ #endif

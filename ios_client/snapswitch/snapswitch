@@ -1,0 +1,101 @@
+#!/var/jb/usr/bin/bash
+# 소리 나는 컴퓨터 쪽으로 자동 전환 (에어팟처럼, 2026-10-17)
+#  설정 /var/mobile/Library/Preferences/snapswitch.conf (mobile이 씀, root가 읽되 source하지 않고 글자 검사 후 사용):  SOURCES="mac=192.168.1.15 pc=192.168.1.22"  (앞쪽이 동시에 시작했을 때 우선)
+#  1초마다 각 컴퓨터의 제어 포트(1705, Snapcast JSON-RPC Server.GetStatus)에서 스트림 상태를 본다.
+#   - "playing" = 지금 소리가 남. 무음이 5초(서버 idle_threshold) 이어져야 "idle" → 잠깐 멈춤으로는 안 바뀜.
+#   - 지금 서버가 playing이면 그대로. 아니면 playing인 서버 중 가장 최근에 소리가 시작된 쪽으로(같으면 목록 앞쪽).
+#   - 아무도 소리 안 나면 그대로 둔다. 바꾼 뒤 5초는 다시 안 바꿈.
+#  바꾸는 법은 켜기.command와 같음: rttfloor 지우고 SERVER 바꾸고 snapclient 재시작.
+#  로그 /var/mobile/Library/Logs/snapswitch.log
+export PATH=/var/jb/usr/bin:/var/jb/bin:/var/jb/usr/sbin:/usr/bin:/bin
+CONF=/var/mobile/Library/Preferences/snapswitch.conf
+LOG=/var/mobile/Library/Logs/snapswitch.log
+SC=/var/jb/etc/snapclient.conf
+PORT=${PORT:-1705}
+# DRYRUN=1: 실제로 안 바꾸고 판단만 화면에 출력(시험용)
+log() { if [ -n "${DRYRUN:-}" ]; then echo "$(date '+%H:%M:%S') $*"; else echo "$(date '+%m-%d %H:%M:%S') $*" >> "$LOG"; fi; }
+
+# raw IP[:제어포트] → Server.GetStatus 응답 한 줄 (없으면 실패)
+raw() {
+  local h=${1%%:*} p=${1#*:}
+  [ "$p" = "$1" ] && p=$PORT
+  timeout ${2:-2} bash -c "exec 3<>/dev/tcp/$h/$p || exit 1
+    printf '%s\r\n' '{\"id\":7,\"jsonrpc\":\"2.0\",\"method\":\"Server.GetStatus\"}' >&3
+    for i in 1 2 3 4; do IFS= read -r l <&3 || exit 1; case \"\$l\" in *'\"id\":7'*) printf '%s' \"\$l\"; exit 0;; esac; done" 2>/dev/null
+}
+
+# probe IP[:제어포트] → playing | idle | down
+probe() {
+  local r
+  r=$(raw "$1") || { echo down; return; }
+  case "$r" in *'"status":"playing"'*) echo playing;; *'"result"'*) echo idle;; *) echo down;; esac
+}
+
+# IP가 바뀌었을 때(공유기 DHCP): 등록된 컴퓨터가 60초 넘게 응답이 없으면 같은 /24를 훑어 1705에 답하는 컴퓨터를 찾아
+# 설정을 고친다(5분에 한 번까지, 바뀐 게 없으면 30분에 한 번). "os":"Darwin" = mac, 나머지 = pc. 한 번에 32개씩 동시에, 각 1초.
+rescan() {
+  local base=$1 i j found=() tmp=/var/mobile/Library/Caches/snapswitch_scan
+  rm -rf "$tmp"; mkdir -p "$tmp"
+  for ((i = 1; i <= 254; i += 32)); do
+    for ((j = i; j < i + 32 && j <= 254; j++)); do
+      ( r=$(raw "$base.$j" 1) && case "$r" in *'"result"'*) case "$r" in *'"os":"Darwin"'*) echo mac;; *) echo pc;; esac > "$tmp/$base.$j";; esac ) &
+    done
+    wait
+  done
+  local mac= pc= f
+  for f in "$tmp"/*; do [ -f "$f" ] || continue; case $(cat "$f") in mac) mac=${mac:-${f##*/}};; pc) pc=${pc:-${f##*/}};; esac; done
+  rm -rf "$tmp"
+  local old=$SOURCES new=
+  for s in $old; do
+    case ${s%%=*} in mac) new="$new mac=${mac:-${s#*=}}";; pc) new="$new pc=${pc:-${s#*=}}";; *) new="$new $s";; esac
+  done
+  new=${new# }
+  if [ "$new" != "$old" ]; then
+    log "주소 다시 찾음: $old → $new"
+    { grep -v '^SOURCES=' "$f_conf" 2>/dev/null; echo "SOURCES=\"$new\""; } > "$f_conf.new" && mv -f "$f_conf.new" "$f_conf"
+    scan_gap=300
+  else
+    scan_gap=1800
+    log "주소 다시 찾기: 바뀐 것 없음 (찾은 것 mac=${mac:-없음} pc=${pc:-없음})"
+  fi
+}
+
+declare -A state start down_since
+last_switch=0
+last_scan=0
+scan_gap=300   # 찾아도 바뀐 게 없으면(컴퓨터가 꺼져 있을 뿐) 30분으로 늘림
+log "시작"
+while :; do
+  f_conf=${SWCONF:-$CONF}
+  SOURCES=$(sed -n 's/^SOURCES="\(.*\)"$/\1/p' "$f_conf" 2>/dev/null | tail -1)
+  ENABLED=$(sed -n 's/^ENABLED=\([01]\)$/\1/p' "$f_conf" 2>/dev/null | tail -1)
+  case "$SOURCES" in *[!A-Za-z0-9=.:\ ]*) log "설정 글자 오류: $SOURCES"; SOURCES=;; esac
+  if [ "${ENABLED:-1}" != 1 ] || [ -z "${SOURCES:-}" ]; then sleep 5; continue; fi
+  now=$(date +%s)
+  cur=${cur_fake:-$(. "$SC"; echo "$SERVER")}
+  best=; best_t=-1; cur_playing=0; need_scan=
+  for s in $SOURCES; do
+    name=${s%%=*}; addr=${s#*=}
+    key=${addr%%:*}; [ -n "${DRYRUN:-}" ] && key=$addr   # 시험 때는 같은 Mac의 다른 포트를 다른 컴퓨터로
+    st=$(probe "$addr")
+    if [ "$st" = playing ] && [ "${state[$key]:-}" != playing ]; then start[$key]=$now; log "$name($addr) 소리 시작"; fi
+    if [ "$st" != playing ] && [ "${state[$key]:-}" = playing ]; then log "$name($addr) 소리 멈춤 ($st)"; fi
+    state[$key]=$st
+    if [ "$st" = down ]; then down_since[$key]=${down_since[$key]:-$now}; else unset "down_since[$key]"; fi
+    [ "$st" = down ] && [ -z "${DRYRUN:-}" ] && [ $((now - ${down_since[$key]})) -ge 60 ] && [ $((now - last_scan)) -ge $scan_gap ] && need_scan=${key%.*}
+    if [ "$st" = playing ]; then
+      [ "$key" = "$cur" ] && cur_playing=1
+      [ "${start[$key]:-0}" -gt "$best_t" ] && { best=$name=$key; best_t=${start[$key]:-0}; }
+    fi
+  done
+  if [ $cur_playing = 0 ] && [ -n "$best" ] && [ "${best#*=}" != "$cur" ] && [ $((now - last_switch)) -ge 5 ]; then
+    ip=${best#*=}
+    log "전환: ${cur:-없음} → ${best%%=*}($ip)"
+    if [ -n "${DRYRUN:-}" ]; then cur_fake=$ip; last_switch=$now; sleep 1; continue; fi
+    rm -f /var/mobile/Library/Caches/snapclient_rttfloor
+    sudo -n snapclient-ctl set SERVER="$ip" >/dev/null && sudo -n snapclient-ctl restart >/dev/null
+    last_switch=$now
+  fi
+  if [ -n "$need_scan" ]; then last_scan=$now; rescan "$need_scan"; fi
+  sleep 1
+done

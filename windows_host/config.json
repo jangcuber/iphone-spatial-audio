@@ -1,0 +1,34 @@
+{
+  "port": 1704,
+  "buffer_ms": 1000,
+  "rate": 48000,
+  "chunk_ms": 20,
+  "input_device": "CABLE Output",
+  "input_channels": 8,
+  "ring_ms": 100,
+  "height_from_surround_db": -9.0,
+  "stereo_upmix": "auto",
+  "mac_ip": "",
+  "mac_wifi_mac": "",
+  "calibration": {
+    "source": "copy delay_ms / gain_db from the Mac's presets/desk.json after run/06 and run/09 (0 = not calibrated)",
+    "delay_ms": {
+      "FL": 0.0,
+      "FR": 0.0,
+      "C": 0.0,
+      "SL": 0.0,
+      "SR": 0.0,
+      "HL": 0.0,
+      "HR": 0.0
+    },
+    "gain_db": {
+      "FL": 0.0,
+      "FR": 0.0,
+      "C": 0.0,
+      "SL": 0.0,
+      "SR": 0.0,
+      "HL": 0.0,
+      "HR": 0.0
+    }
+  }
+}

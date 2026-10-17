@@ -1,0 +1,14 @@
+#!/var/jb/bin/sh
+# LaunchDaemon이 실행하는 래퍼: 설정 파일을 읽어 snapclient를 띄운다.
+CONF=/var/jb/etc/snapclient.conf
+[ -f "$CONF" ] && . "$CONF"
+URL=""
+[ -n "$SERVER" ] && URL="tcp://$SERVER:1704"
+# 화면이 꺼져 있어도 폰이 잠들지 않게 (잠들면 서버가 다시 켜져도 몇 분간 재접속 못 함). KEEPAWAKE=0이면 끔
+[ "${KEEPAWAKE:-1}" = 0 ] || /var/jb/usr/bin/keepawake &
+# STATS=1: 1초마다 동기 상태(Stats: age, 중앙값 등)를 로그에 남김 (진단용)
+LOGFILTER="*:info"
+[ "${STATS:-0}" = 1 ] && LOGFILTER="*:info,Stats:debug,TimeSync:debug,Dac:debug"
+exec /var/jb/usr/bin/snapclient --hostID "${NAME:-iphone}" --player coreaudio \
+     --channel "${CHANNEL:--1}" --latency "${LATENCY:-0}" --logfilter "$LOGFILTER" \
+     --logsink "file:/var/mobile/Library/Logs/snapclient.log" $EXTRA_ARGS $URL

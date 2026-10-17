@@ -1,0 +1,12 @@
+# 스피커 폰 목록 — run/14_add_phone.command가 새 폰을 넣을 때 고칩니다. 처음 실행 때 run/phones.txt로 복사됩니다.
+# 이름     채널  Wi-Fi IP        UDID(USB)                    iOS
+#  IP를 모르면 "-". UDID는 USB 설치 때만 필요(idevice_id -l). 채널: FL FR C SL SR HL HR
+node-01   FL    -               -                            -
+node-02   FR    -               -                            -
+node-03   C     -               -                            -
+node-04   SL    -               -                            -
+node-05   SR    -               -                            -
+node-06   HL    -               -                            -
+node-07   HR    -               -                            -
+# 마이크(보정 녹음용, 스피커 아님 — 탈옥 폰 한 대, 없으면 Mac 내장 마이크)
+mic       -     -               -                            -

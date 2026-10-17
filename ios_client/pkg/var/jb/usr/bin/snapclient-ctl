@@ -1,0 +1,28 @@
+#!/var/jb/bin/sh
+# 사용법: snapclient-ctl {start|stop|restart|enable|disable|status|log|test [서버IP]|set 키=값 ...}
+CONF=/var/jb/etc/snapclient.conf
+PLIST=/var/jb/Library/LaunchDaemons/io.github.jangcuber.snapclient.plist
+LABEL=io.github.jangcuber.snapclient
+LOG=/var/mobile/Library/Logs/snapclient.log
+export PATH="/var/jb/usr/bin:/var/jb/bin:/var/jb/usr/sbin:/usr/bin:/bin:$PATH"
+case "$1" in
+  enable)  launchctl load -w "$PLIST" && echo "자동 실행 켬 (부팅/재탈옥 후에도 시작)";;
+  disable) launchctl unload -w "$PLIST" && echo "자동 실행 끔";;
+  start)   launchctl load "$PLIST" 2>/dev/null; launchctl kickstart -k system/$LABEL 2>/dev/null; echo "시작";;
+  stop)    launchctl unload "$PLIST" && echo "중지";;
+  restart) launchctl unload "$PLIST" 2>/dev/null; launchctl load "$PLIST" && echo "재시작";;
+  status)  launchctl list | grep -i snapclient || echo "자동 실행 꺼짐(데몬 미적재)"; ps -ax -o pid=,command= | grep "[/]var/jb/usr/bin/snapclient " || echo "snapclient 프로세스 없음";;
+  log)     tail -n ${2:-40} "$LOG";;
+  test)    shift; echo "포그라운드 실행 (Ctrl-C 종료). 화면을 잠가도 소리가 계속 나는지 확인하세요";
+           /var/jb/usr/bin/snapclient --player coreaudio --logsink stdout ${1:+tcp://$1:1704};;
+  set)     # 예: sudo snapclient-ctl set NAME=node-03 SERVER=192.168.1.97 CHANNEL=2  (적용은 restart)
+           shift
+           for kv in "$@"; do
+             k=${kv%%=*}; v=${kv#*=}
+             case "$k" in NAME|SERVER|CHANNEL|LATENCY|EXTRA_ARGS|KEEPAWAKE|STATS) ;; *) echo "모르는 키: $k"; exit 1;; esac
+             case "$v" in *[!A-Za-z0-9._:\ -]*) echo "허용 안 되는 문자: $kv"; exit 1;; esac
+             grep -v "^$k=" "$CONF" > "$CONF.new" && echo "$k='$v'" >> "$CONF.new" && mv "$CONF.new" "$CONF"
+           done
+           chmod 644 "$CONF"; grep -v '^#' "$CONF";;
+  *) echo "사용법: snapclient-ctl {start|stop|restart|enable|disable|status|log [줄수]|test [서버IP]|set 키=값 ...}"; exit 1;;
+esac

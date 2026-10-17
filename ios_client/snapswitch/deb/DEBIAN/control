@@ -1,0 +1,9 @@
+Package: io.github.jangcuber.snapswitch
+Name: snapswitch
+Version: 1.2
+Architecture: iphoneos-arm64
+Description: Mac/PC 중 소리 나는 쪽으로 snapclient 서버 자동 전환
+Maintainer: jangcuber (github.com/jangcuber)
+Author: jangcuber
+Section: Utilities
+Depends: io.github.jangcuber.snapclient
